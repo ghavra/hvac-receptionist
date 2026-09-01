@@ -1,3 +1,6 @@
+import { WebSocket as ws } from 'ws';
+globalThis.WebSocket = globalThis.WebSocket || ws;
+
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import twilio from 'twilio';

@@ -95,8 +95,14 @@ async function saveProfile(callId, args, callerPhone) {
   if (typeof args.systemType === 'string' && args.systemType.trim()) merged.system_type = args.systemType.trim();
   if (!merged.phone && callerPhone) merged.phone = callerPhone; // caller-ID prefill
 
-  const { error } = await sb().from('call_profiles').upsert(merged);
-  if (error) console.error('saveProfile upsert error:', error.message);
+  // FIX 1: Explicitly check if existing record is present to update or insert
+  if (existing) {
+    const { error } = await sb().from('call_profiles').update(merged).eq('call_id', callId);
+    if (error) console.error('saveProfile update error:', error.message);
+  } else {
+    const { error } = await sb().from('call_profiles').insert(merged);
+    if (error) console.error('saveProfile insert error:', error.message);
+  }
 
   merged.received = REQUIRED.filter(k => merged[k]);
   merged.stillNeeded = REQUIRED.filter(k => !merged[k]);
@@ -121,6 +127,12 @@ async function findSlots(preference) {
   else if (/evening/.test(p)) filtered = filtered.filter(s => h(s) >= 17);
 
   const chosen = (filtered.length ? filtered : open ?? []).slice(0, 3);
+  
+  // FIX 2: Prevent AI from hallucinating slots if the database returns 0 results
+  if (chosen.length === 0) {
+    return { error: "No slots available in the database. Tell the user a manager will call them to schedule manually." };
+  }
+
   return chosen.map(s => ({
     id: s.id,
     when: new Date(s.starts_at).toLocaleString('en-US',
@@ -165,7 +177,7 @@ async function finalizeLead(msg) {
   lead.ended_reason = msg.endedReason;
   lead.transcript = msg.transcript;
 
-  const { error } = await sb().from('leads').upsert(lead);
+  const { error } = await sb().from('leads').upsert(lead, { onConflict: 'call_id' });
   if (error) console.error('leads upsert error:', error.message);
   await sendOwnerSheet(lead);
 }

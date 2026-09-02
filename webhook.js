@@ -29,7 +29,6 @@ app.get('/seed', async (req, res) => {
       const day = new Date(); day.setDate(day.getDate() + d);
       for (let h = 8; h < 17; h++) {
         const s = new Date(day); s.setHours(h, 0, 0, 0);
-        // FIX: Explicitly set booked: false on seed
         const { error } = await sb().from('slots').upsert({ id: 's' + Math.floor(s.getTime() / 1000), starts_at: s.toISOString(), booked: false });
         if (error) throw error;
         n++;
@@ -96,7 +95,6 @@ async function saveProfile(callId, args, callerPhone) {
   if (typeof args.systemType === 'string' && args.systemType.trim()) merged.system_type = args.systemType.trim();
   if (!merged.phone && callerPhone) merged.phone = callerPhone; // caller-ID prefill
 
-  // FIX: Explicitly check if existing record is present to update or insert
   if (existing) {
     const { error } = await sb().from('call_profiles').update(merged).eq('call_id', callId);
     if (error) console.error('saveProfile update error:', error.message);
@@ -111,13 +109,16 @@ async function saveProfile(callId, args, callerPhone) {
 }
 
 async function findSlots(preference) {
-  // FIX: Check for null OR false so slots show up properly
   const { data: open, error } = await sb().from('slots')
     .select('id, starts_at')
-    .or('booked.is.null,booked.eq.false')
+    .eq('booked', false)
     .gte('starts_at', new Date().toISOString())
     .order('starts_at').limit(60);
-  if (error) console.error('findSlots error:', error.message);
+    
+  if (error) {
+    console.error('findSlots error:', error.message);
+    return { error: "Database error finding slots." };
+  }
 
   const p = (preference || '').toLowerCase();
   const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
@@ -145,9 +146,8 @@ async function findSlots(preference) {
 async function book(callId, slotId) {
   if (!slotId) return { status: 'error', message: 'missing slotId' };
 
-  // FIX: Atomic claim checking null or false
   const { data: slot, error } = await sb().from('slots')
-    .update({ booked: true }).eq('id', slotId).or('booked.is.null,booked.eq.false')
+    .update({ booked: true }).eq('id', slotId).eq('booked', false)
     .select().maybeSingle();
   if (error) console.error('book claim error:', error.message);
   if (!slot) return { status: 'no_longer_available', alternatives: await findSlots('') };
@@ -208,5 +208,27 @@ async function sms(body) {
   }
   await sb().from('notify_failures').insert({ channel: 'sms', body });
 }
+
+// ---- DEBUG ROUTE ----
+app.get('/debug', async (req, res) => {
+  if (req.query.key !== process.env.VAPI_SECRET) return res.sendStatus(401);
+  try {
+    const { data: all, error: err1 } = await sb().from('slots').select('*').limit(5);
+    const { data: open, error: err2 } = await sb().from('slots')
+      .select('id, starts_at, booked')
+      .eq('booked', false)
+      .gte('starts_at', new Date().toISOString())
+      .limit(5);
+    const { count } = await sb().from('slots').select('*', { count: 'exact', head: true });
+    
+    res.json({
+      totalSlotsInDB: count,
+      firstFiveSlots: all,
+      firstFiveOpenSlots: open,
+      errors: { all: err1?.message, open: err2?.message },
+      serverTime: new Date().toISOString()
+    });
+  } catch (e) { res.status(500).send('Debug failed: ' + e.message); }
+});
 
 app.listen(process.env.PORT || 3000);

@@ -24,14 +24,14 @@ app.get('/seed', async (req, res) => {
     let n = 0;
     for (let d = 1; d <= 7; d++) {
       const day = new Date(); day.setDate(day.getDate() + d);
-      for (let h = 8; h < 17; h++) {
+      for (let h = 8; h < 21; h++) {
         const s = new Date(day); s.setHours(h, 0, 0, 0);
         const { error } = await sb().from('slots').upsert({ id: 's' + Math.floor(s.getTime() / 1000), starts_at: s.toISOString(), booked: false });
         if (error) throw error;
         n++;
       }
     }
-    res.send('Seeded ' + n + ' slots (next 7 days, 8am-4pm). Safe to re-run anytime.');
+    res.send('Seeded ' + n + ' slots (next 7 days, 8am-8pm including evenings). Safe to re-run anytime.');
   } catch (e) { res.status(500).send('Seed failed: ' + e.message); }
 });
 
@@ -64,7 +64,6 @@ app.get('/selftest', async (req, res) => {
   const out = {};
   try { out.withSecretHeader = await post(true); } catch (e) { out.withSecretHeader = { error: e.message }; }
   try { out.withoutSecretHeader = await post(false); } catch (e) { out.withoutSecretHeader = { error: e.message }; }
-  // FIXED: check for "results" (with the s) and "toolCallId" to match new format
   const ok = out.withSecretHeader.httpStatus === 200 &&
     (out.withSecretHeader.responseBody || '').includes('"results"') &&
     (out.withSecretHeader.responseBody || '').includes('"toolCallId"');
@@ -75,10 +74,9 @@ app.get('/selftest', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  MAIN WEBHOOK — This is the fixed version with correct Vapi response format
+//  MAIN WEBHOOK — Correct Vapi response format
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/webhook/vapi', async (req, res) => {
-  // ── Auth ──
   if (req.headers['x-vapi-secret'] !== process.env.VAPI_SECRET) {
     console.log('!! AUTH FAILED -> 401. header received: ' + JSON.stringify(req.headers['x-vapi-secret']) +
       ' | VAPI_SECRET on server: ' + JSON.stringify(process.env.VAPI_SECRET));
@@ -89,7 +87,6 @@ app.post('/webhook/vapi', async (req, res) => {
   if (!msg) { console.log('!! request had no "message" object'); return res.sendStatus(200); }
 
   try {
-    // ── Handle tool-calls ──
     if (msg.type === 'tool-calls' || msg.type === 'tool-call') {
       const calls = msg.toolCalls ?? msg.toolCallList ?? (msg.toolCall ? [msg.toolCall] : []);
       console.log('>> tool message "' + msg.type + '": ' + (calls.map(c => c.function?.name).join(', ') || 'NO CALLS FOUND'));
@@ -102,21 +99,16 @@ app.post('/webhook/vapi', async (req, res) => {
       for (const tc of calls) {
         const resultString = await runTool(tc, msg);
         console.log('>> result for "' + tc.function?.name + '" (toolCallId: ' + tc.id + '): ' + String(resultString).slice(0, 300));
-
-        // ✅ FIX 1: Include toolCallId so Vapi can match the result to the call
-        // ✅ FIX 2: result is always a plain string
         results.push({
           toolCallId: tc.id,
           result: typeof resultString === 'string' ? resultString : JSON.stringify(resultString)
         });
       }
 
-      // ✅ FIX 3: Wrap in { results: [...] } — the EXACT schema Vapi requires
       console.log('>> Full response to Vapi: ' + JSON.stringify({ results }).slice(0, 500));
       return res.json({ results });
     }
 
-    // ── End-of-call report ──
     if (msg.type === 'end-of-call-report') {
       res.sendStatus(200);
       finalizeLead(msg).catch(console.error);
@@ -124,7 +116,6 @@ app.post('/webhook/vapi', async (req, res) => {
     }
   } catch (e) {
     console.error('!! webhook error', e);
-    // Even error responses must use the correct schema
     const calls = msg.toolCalls ?? msg.toolCallList ?? (msg.toolCall ? [msg.toolCall] : []);
     const errorResults = calls.map(tc => ({
       toolCallId: tc.id,
@@ -145,8 +136,13 @@ app.post('/webhook/vapi', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 async function runTool(tc, msg) {
   const name = tc.function?.name;
+  const rawArgs = tc.function?.arguments || '{}';
   let args = {};
-  try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+  try { args = JSON.parse(rawArgs); } catch {}
+
+  // LOG EVERYTHING so we can see exactly what the AI is sending
+  console.log('>> runTool "' + name + '" — raw arguments: ' + rawArgs);
+  console.log('>> runTool "' + name + '" — parsed args keys: ' + Object.keys(args).join(', '));
 
   if (name === 'saveCustomerInfo') {
     const p = await saveProfile(msg.call.id, args, msg.call?.customer?.number);
@@ -166,21 +162,32 @@ async function runTool(tc, msg) {
   }
 
   if (name === 'bookAppointment') {
-    const booking = await book(msg.call.id, args.slotId);
+    // ✅ FIX: Try every possible parameter name the AI might use
+    const slotId = args.slotId || args.slot_id || args.slotid || args.id || args.slot || null;
+    console.log('>> bookAppointment — extracted slotId: ' + JSON.stringify(slotId) + ' from args: ' + JSON.stringify(args));
+
+    const booking = await book(msg.call.id, slotId);
+    console.log('>> bookAppointment — booking result: ' + JSON.stringify(booking));
+
     if (booking.status === 'confirmed') {
-      return 'Appointment confirmed for ' + booking.when + '. Confirmation code: ' + booking.confirmationCode + '. Tell the caller their appointment is booked.';
+      return 'Appointment confirmed for ' + booking.when + '. Confirmation code: ' + booking.confirmationCode + '. Tell the caller their appointment is booked and give them the confirmation code.';
     }
     if (booking.status === 'no_longer_available') {
-      return 'That slot is no longer available. Offer the caller these alternatives instead: ' + JSON.stringify(booking.alternatives);
+      const altSlots = booking.alternatives?.slots;
+      if (altSlots && altSlots.length > 0) {
+        const altText = altSlots.map(s => s.when + ' (ID: ' + s.id + ')').join(', ');
+        return 'That time slot was already taken. Here are other available times: ' + altText + '. Ask the caller which one they prefer.';
+      }
+      return 'That time slot was already taken and no other slots are available. Tell the caller a manager will call them back to schedule.';
     }
-    return 'Booking error: ' + (booking.message || 'unknown error');
+    return 'Booking error: ' + (booking.message || 'unknown error') + '. Tell the caller you will have a manager call them back to book the appointment.';
   }
 
   return 'Unknown tool: ' + name;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  HELPER FUNCTIONS — these are unchanged from your original
+//  HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 async function saveProfile(callId, args, callerPhone) {
   const { data: existing, error: selErr } = await sb().from('call_profiles').select().eq('call_id', callId).maybeSingle();
@@ -237,7 +244,7 @@ async function findSlots(preference) {
 async function book(callId, slotId) {
   console.log('>> book() called with callId=' + callId + ', slotId=' + JSON.stringify(slotId));
 
-  if (!slotId) return { status: 'error', message: 'missing slotId' };
+  if (!slotId) return { status: 'error', message: 'missing slotId — the AI did not pass a slot ID' };
 
   // ✅ FIX: Check if this call already has a booking (prevents AI retry loop)
   const { data: existingAppt } = await sb().from('appointments')
@@ -259,9 +266,8 @@ async function book(callId, slotId) {
   if (error) console.error('book claim error:', error.message);
 
   if (!slot) {
-    // Check if the slot exists but is already booked (vs truly unavailable)
     const { data: existingSlot } = await sb().from('slots').select('id, starts_at, booked').eq('id', slotId).maybeSingle();
-    console.log('>> book() — slot not claimable. existingSlot=' + JSON.stringify(existingSlot));
+    console.log('>> book() — slot not claimable. slotId=' + slotId + ', existingSlot=' + JSON.stringify(existingSlot));
     return { status: 'no_longer_available', alternatives: await findSlots('') };
   }
 
@@ -318,3 +324,5 @@ async function sms(body) {
 }
 
 app.listen(process.env.PORT || 3000);
+
+

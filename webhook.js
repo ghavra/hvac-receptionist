@@ -6,7 +6,6 @@ import { createClient } from '@supabase/supabase-js';
 import twilio from 'twilio';
 import { Resend } from 'resend';
 
-// Lazy clients: server boots even if a variable is missing (easier debugging)
 let _sb, _tw, _re;
 const sb = () => (_sb ??= createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY));
 const tw = () => (_tw ??= twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN));
@@ -17,10 +16,8 @@ const REQUIRED = ['name', 'phone', 'address', 'city', 'issue', 'urgency', 'avail
 const app = express();
 app.use(express.json());
 
-// ---- Browser check routes ----
 app.get('/', (req, res) => res.send('Server is live'));
 
-// Visit /seed?key=YOUR_VAPI_SECRET once after deploying (fills the schedule)
 app.get('/seed', async (req, res) => {
   if (req.query.key !== process.env.VAPI_SECRET) return res.sendStatus(401);
   try {
@@ -38,14 +35,12 @@ app.get('/seed', async (req, res) => {
   } catch (e) { res.status(500).send('Seed failed: ' + e.message); }
 });
 
-// Visit /test-save?key=YOUR_VAPI_SECRET to verify the database connection
 app.get('/test-save', async (req, res) => {
   if (req.query.key !== process.env.VAPI_SECRET) return res.sendStatus(401);
   try { res.json(await saveProfile('browser-test', { name: 'John' }, '+15550000000')); }
   catch (e) { res.status(500).send('Test failed: ' + e.message); }
 });
 
-// ---- The Vapi webhook (this is what Vapi talks to) ----
 app.post('/webhook/vapi', async (req, res) => {
   if (req.headers['x-vapi-secret'] !== process.env.VAPI_SECRET) return res.sendStatus(401);
   const msg = req.body.message;
@@ -54,14 +49,9 @@ app.post('/webhook/vapi', async (req, res) => {
     if (msg.type === 'tool-calls' || msg.type === 'tool-call') {
       const calls = msg.toolCalls ?? (msg.toolCall ? [msg.toolCall] : []);
       const results = [];
-      for (const tc of calls) {
-        // FIX: Vapi requires the toolCallId to match the result
-        results.push({ 
-          toolCallId: tc.id, 
-          result: await runTool(tc, msg) 
-        });
-      }
-      return res.json({ results });
+      // FIX: Reverted to the exact response format Vapi expects
+      for (const tc of calls) results.push({ result: await runTool(tc, msg) });
+      return res.json(results);
     }
     if (msg.type === 'end-of-call-report') {
       res.sendStatus(200);
@@ -70,12 +60,11 @@ app.post('/webhook/vapi', async (req, res) => {
     }
   } catch (e) {
     console.error('webhook error', e);
-    return res.json({ results: [{ toolCallId: 'error', result: JSON.stringify({ error: 'temporary system issue' }) }] });
+    return res.json([{ result: JSON.stringify({ error: 'temporary system issue' }) }]);
   }
   res.sendStatus(200);
 });
 
-// ---- TOOLS ----
 async function runTool(tc, msg) {
   const name = tc.function?.name;
   let args = {};
@@ -87,12 +76,15 @@ async function runTool(tc, msg) {
   }
   
   if (name === 'checkAvailability') {
-    const slots = await findSlots(args.preference);
-    // FIX: Return a plain English string so the AI doesn't get confused by JSON
-    if (slots.error) return slots.error;
-    if (!slots || slots.length === 0) return "No slots available. Tell the user a manager will call them to schedule manually.";
+    const result = await findSlots(args.preference);
+    if (result.error) return JSON.stringify({ error: result.error });
+    if (!result.slots || result.slots.length === 0) return JSON.stringify({ error: "No slots available. Tell the user a manager will call them." });
     
-    const slotText = slots.map(s => `${s.when} (ID: ${s.id})`).join(', ');
+    const slotText = result.slots.map(s => `${s.when} (ID: ${s.id})`).join(', ');
+    
+    if (result.fallback) {
+      return `I couldn't find any slots matching the exact preference, but here are the closest available times: ${slotText}. Ask the user if any of these work.`;
+    }
     return `Available slots: ${slotText}. Ask the user which one they prefer.`;
   }
   
@@ -116,7 +108,7 @@ async function saveProfile(callId, args, callerPhone) {
     if (typeof args[k] === 'string' && args[k].trim()) merged[k] = args[k].trim();
   }
   if (typeof args.systemType === 'string' && args.systemType.trim()) merged.system_type = args.systemType.trim();
-  if (!merged.phone && callerPhone) merged.phone = callerPhone; // caller-ID prefill
+  if (!merged.phone && callerPhone) merged.phone = callerPhone;
 
   if (existing) {
     const { error } = await sb().from('call_profiles').update(merged).eq('call_id', callId);
@@ -153,17 +145,26 @@ async function findSlots(preference) {
   else if (/afternoon/.test(p)) filtered = filtered.filter(s => h(s) >= 12 && h(s) < 17);
   else if (/evening/.test(p)) filtered = filtered.filter(s => h(s) >= 17);
 
-  const chosen = (filtered.length ? filtered : open ?? []).slice(0, 3);
+  let isFallback = false;
+  let chosen = filtered;
   
   if (chosen.length === 0) {
-    return { error: "No slots available in the database. Tell the user a manager will call them to schedule manually." };
+    chosen = open ?? [];
+    isFallback = true;
+  }
+  
+  const finalSlots = chosen.slice(0, 3);
+  
+  if (finalSlots.length === 0) {
+    return { error: "No slots available in the database." };
   }
 
-  return chosen.map(s => ({
+  const mapped = finalSlots.map(s => ({
     id: s.id,
-    when: new Date(s.starts_at).toLocaleString('en-US',
-      { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    when: new Date(s.starts_at).toLocaleString('en-US', { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
   }));
+  
+  return { slots: mapped, fallback: isFallback };
 }
 
 async function book(callId, slotId) {
@@ -176,8 +177,7 @@ async function book(callId, slotId) {
   if (!slot) return { status: 'no_longer_available', alternatives: await findSlots('') };
 
   const code = 'HV-' + Math.floor(1000 + Math.random() * 9000);
-  const when = new Date(slot.starts_at).toLocaleString('en-US',
-    { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  const when = new Date(slot.starts_at).toLocaleString('en-US', { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   const { error: insErr } = await sb().from('appointments').insert({ call_id: callId, slot_id: slotId, confirmation_code: code });
   if (insErr) console.error('appointment insert error:', insErr.message);
 
@@ -185,15 +185,13 @@ async function book(callId, slotId) {
   return { status: 'confirmed', confirmationCode: code, when };
 }
 
-// ---- END OF CALL + NOTIFICATIONS ----
 async function finalizeLead(msg) {
   const extracted = msg.analysis?.structuredData ?? {};
   const { data: profile } = await sb().from('call_profiles').select().eq('call_id', msg.call.id).maybeSingle();
   const { data: appt } = await sb().from('appointments')
     .select('confirmation_code, slots(starts_at)').eq('call_id', msg.call.id).maybeSingle();
 
-  const EXT = { name: 'customerName', phone: 'phone', address: 'address', city: 'city',
-                issue: 'issue', system_type: 'systemType', urgency: 'urgency', availability: 'availability' };
+  const EXT = { name: 'customerName', phone: 'phone', address: 'address', city: 'city', issue: 'issue', system_type: 'systemType', urgency: 'urgency', availability: 'availability' };
   const lead = { call_id: msg.call.id };
   for (const [db, ext] of Object.entries(EXT)) lead[db] = profile?.[db] ?? extracted[ext] ?? null;
   lead.booked = !!appt;
@@ -231,27 +229,5 @@ async function sms(body) {
   }
   await sb().from('notify_failures').insert({ channel: 'sms', body });
 }
-
-// ---- DEBUG ROUTE ----
-app.get('/debug', async (req, res) => {
-  if (req.query.key !== process.env.VAPI_SECRET) return res.sendStatus(401);
-  try {
-    const { data: all, error: err1 } = await sb().from('slots').select('*').limit(5);
-    const { data: open, error: err2 } = await sb().from('slots')
-      .select('id, starts_at, booked')
-      .eq('booked', false)
-      .gte('starts_at', new Date().toISOString())
-      .limit(5);
-    const { count } = await sb().from('slots').select('*', { count: 'exact', head: true });
-    
-    res.json({
-      totalSlotsInDB: count,
-      firstFiveSlots: all,
-      firstFiveOpenSlots: open,
-      errors: { all: err1?.message, open: err2?.message },
-      serverTime: new Date().toISOString()
-    });
-  } catch (e) { res.status(500).send('Debug failed: ' + e.message); }
-});
 
 app.listen(process.env.PORT || 3000);

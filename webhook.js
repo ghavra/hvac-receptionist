@@ -50,7 +50,12 @@ app.post('/webhook/vapi', async (req, res) => {
       const calls = msg.toolCalls ?? (msg.toolCall ? [msg.toolCall] : []);
       const results = [];
       // FIX: Reverted to the exact response format Vapi expects
-      for (const tc of calls) results.push({ result: await runTool(tc, msg) });
+      for (const tc of calls) {
+        results.push({ 
+          toolCallId: tc.id,  // <--- THIS IS THE MISSING LINE
+          result: await runTool(tc, msg) 
+        });
+      }
       return res.json(results);
     }
     if (msg.type === 'end-of-call-report') {

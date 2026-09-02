@@ -235,17 +235,42 @@ async function findSlots(preference) {
 }
 
 async function book(callId, slotId) {
+  console.log('>> book() called with callId=' + callId + ', slotId=' + JSON.stringify(slotId));
+
   if (!slotId) return { status: 'error', message: 'missing slotId' };
+
+  // ✅ FIX: Check if this call already has a booking (prevents AI retry loop)
+  const { data: existingAppt } = await sb().from('appointments')
+    .select('confirmation_code, slot_id, slots(starts_at)')
+    .eq('call_id', callId)
+    .maybeSingle();
+
+  if (existingAppt) {
+    console.log('>> book() — already booked for this call, returning existing booking');
+    const when = new Date(existingAppt.slots.starts_at).toLocaleString('en-US', {
+      weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+    });
+    return { status: 'confirmed', confirmationCode: existingAppt.confirmation_code, when };
+  }
+
   const { data: slot, error } = await sb().from('slots')
     .update({ booked: true }).eq('id', slotId).eq('booked', false)
     .select().maybeSingle();
   if (error) console.error('book claim error:', error.message);
-  if (!slot) return { status: 'no_longer_available', alternatives: await findSlots('') };
+
+  if (!slot) {
+    // Check if the slot exists but is already booked (vs truly unavailable)
+    const { data: existingSlot } = await sb().from('slots').select('id, starts_at, booked').eq('id', slotId).maybeSingle();
+    console.log('>> book() — slot not claimable. existingSlot=' + JSON.stringify(existingSlot));
+    return { status: 'no_longer_available', alternatives: await findSlots('') };
+  }
+
   const code = 'HV-' + Math.floor(1000 + Math.random() * 9000);
   const when = new Date(slot.starts_at).toLocaleString('en-US', { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   const { error: insErr } = await sb().from('appointments').insert({ call_id: callId, slot_id: slotId, confirmation_code: code });
   if (insErr) console.error('appointment insert error:', insErr.message);
   notifyOwnerInstant(callId, code, when).catch(console.error);
+  console.log('>> book() — SUCCESS. code=' + code + ', when=' + when);
   return { status: 'confirmed', confirmationCode: code, when };
 }
 

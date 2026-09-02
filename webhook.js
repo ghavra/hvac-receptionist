@@ -29,7 +29,8 @@ app.get('/seed', async (req, res) => {
       const day = new Date(); day.setDate(day.getDate() + d);
       for (let h = 8; h < 17; h++) {
         const s = new Date(day); s.setHours(h, 0, 0, 0);
-        const { error } = await sb().from('slots').upsert({ id: 's' + Math.floor(s.getTime() / 1000), starts_at: s.toISOString() });
+        // FIX: Explicitly set booked: false on seed
+        const { error } = await sb().from('slots').upsert({ id: 's' + Math.floor(s.getTime() / 1000), starts_at: s.toISOString(), booked: false });
         if (error) throw error;
         n++;
       }
@@ -95,7 +96,7 @@ async function saveProfile(callId, args, callerPhone) {
   if (typeof args.systemType === 'string' && args.systemType.trim()) merged.system_type = args.systemType.trim();
   if (!merged.phone && callerPhone) merged.phone = callerPhone; // caller-ID prefill
 
-  // FIX 1: Explicitly check if existing record is present to update or insert
+  // FIX: Explicitly check if existing record is present to update or insert
   if (existing) {
     const { error } = await sb().from('call_profiles').update(merged).eq('call_id', callId);
     if (error) console.error('saveProfile update error:', error.message);
@@ -110,8 +111,10 @@ async function saveProfile(callId, args, callerPhone) {
 }
 
 async function findSlots(preference) {
+  // FIX: Check for null OR false so slots show up properly
   const { data: open, error } = await sb().from('slots')
-    .select('id, starts_at').eq('booked', false)
+    .select('id, starts_at')
+    .or('booked.is.null,booked.eq.false')
     .gte('starts_at', new Date().toISOString())
     .order('starts_at').limit(60);
   if (error) console.error('findSlots error:', error.message);
@@ -128,7 +131,6 @@ async function findSlots(preference) {
 
   const chosen = (filtered.length ? filtered : open ?? []).slice(0, 3);
   
-  // FIX 2: Prevent AI from hallucinating slots if the database returns 0 results
   if (chosen.length === 0) {
     return { error: "No slots available in the database. Tell the user a manager will call them to schedule manually." };
   }
@@ -143,9 +145,9 @@ async function findSlots(preference) {
 async function book(callId, slotId) {
   if (!slotId) return { status: 'error', message: 'missing slotId' };
 
-  // Atomic claim: WHERE booked=false makes double-booking impossible
+  // FIX: Atomic claim checking null or false
   const { data: slot, error } = await sb().from('slots')
-    .update({ booked: true }).eq('id', slotId).eq('booked', false)
+    .update({ booked: true }).eq('id', slotId).or('booked.is.null,booked.eq.false')
     .select().maybeSingle();
   if (error) console.error('book claim error:', error.message);
   if (!slot) return { status: 'no_longer_available', alternatives: await findSlots('') };

@@ -281,7 +281,7 @@ async function book(callId, slotId) {
   const when = new Date(slot.starts_at).toLocaleString('en-US', { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   const { error: insErr } = await sb().from('appointments').insert({ call_id: callId, slot_id: slotId, confirmation_code: code });
   if (insErr) console.error('appointment insert error:', insErr.message);
-  notifyOwnerInstant(callId, code, when).catch(console.error);
+  notifyPartiesInstant(callId, code, when).catch(console.error);
   console.log('>> book() — SUCCESS. code=' + code + ', when=' + when);
   return { status: 'confirmed', confirmationCode: code, when };
 }
@@ -304,9 +304,18 @@ async function finalizeLead(msg) {
   await sendOwnerSheet(lead);
 }
 
-async function notifyOwnerInstant(callId, code, when) {
+async function notifyPartiesInstant(callId, code, when) {
   const { data: p } = await sb().from('call_profiles').select('name, issue, customer_phone').eq('call_id', callId).maybeSingle();
+  
+  // 1. Notify the Business Owner
   await sms('BOOKED: ' + (p?.name ?? 'New lead') + ' — ' + when + ' (' + code + '). Callback ' + (p?.customer_phone ?? 'unknown') + '. Issue: ' + (p?.issue ?? 'n/a'));
+
+  // 2. Notify the Customer (Caller)
+  if (p?.customer_phone) {
+    const firstName = p?.name ? p.name.split(' ')[0] : 'there';
+    const customerMsg = `Hi ${firstName}, this is Sarah from Acme HVAC. Your appointment is confirmed for ${when}. Your confirmation code is ${code}. We'll see you then!`;
+    await sms(customerMsg, p.customer_phone);
+  }
 }
 
 async function sendOwnerSheet(lead) {
@@ -321,9 +330,10 @@ async function sendOwnerSheet(lead) {
   if (error) console.error('email error:', error.message);
 }
 
-async function sms(body) {
+async function sms(body, toPhone) {
+  const recipient = toPhone || process.env.OWNER_PHONE;
   for (let i = 0; i < 4; i++) {
-    try { return await tw().messages.create({ body, from: process.env.TWILIO_FROM, to: process.env.OWNER_PHONE }); }
+    try { return await tw().messages.create({ body, from: process.env.TWILIO_FROM, to: recipient }); }
     catch (e) { console.error('twilio retry ' + i + ':', e.message); await new Promise(r => setTimeout(r, 500 * 2 ** i)); }
   }
   await sb().from('notify_failures').insert({ channel: 'sms', body });

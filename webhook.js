@@ -54,8 +54,14 @@ app.post('/webhook/vapi', async (req, res) => {
     if (msg.type === 'tool-calls' || msg.type === 'tool-call') {
       const calls = msg.toolCalls ?? (msg.toolCall ? [msg.toolCall] : []);
       const results = [];
-      for (const tc of calls) results.push({ result: await runTool(tc, msg) });
-      return res.json(results);
+      for (const tc of calls) {
+        // FIX: Vapi requires the toolCallId to match the result
+        results.push({ 
+          toolCallId: tc.id, 
+          result: await runTool(tc, msg) 
+        });
+      }
+      return res.json({ results });
     }
     if (msg.type === 'end-of-call-report') {
       res.sendStatus(200);
@@ -64,7 +70,7 @@ app.post('/webhook/vapi', async (req, res) => {
     }
   } catch (e) {
     console.error('webhook error', e);
-    return res.json([{ result: JSON.stringify({ error: 'temporary system issue' }) }]);
+    return res.json({ results: [{ toolCallId: 'error', result: JSON.stringify({ error: 'temporary system issue' }) }] });
   }
   res.sendStatus(200);
 });
@@ -79,8 +85,25 @@ async function runTool(tc, msg) {
     const p = await saveProfile(msg.call.id, args, msg.call?.customer?.number);
     return JSON.stringify({ received: p.received, stillNeeded: p.stillNeeded });
   }
-  if (name === 'checkAvailability') return JSON.stringify({ slots: await findSlots(args.preference) });
-  if (name === 'bookAppointment') return JSON.stringify(await book(msg.call.id, args.slotId));
+  
+  if (name === 'checkAvailability') {
+    const slots = await findSlots(args.preference);
+    // FIX: Return a plain English string so the AI doesn't get confused by JSON
+    if (slots.error) return slots.error;
+    if (!slots || slots.length === 0) return "No slots available. Tell the user a manager will call them to schedule manually.";
+    
+    const slotText = slots.map(s => `${s.when} (ID: ${s.id})`).join(', ');
+    return `Available slots: ${slotText}. Ask the user which one they prefer.`;
+  }
+  
+  if (name === 'bookAppointment') {
+    const booking = await book(msg.call.id, args.slotId);
+    if (booking.status === 'confirmed') {
+      return `Appointment confirmed for ${booking.when}. Confirmation code is ${booking.confirmationCode}. Tell the user their appointment is booked.`;
+    }
+    return JSON.stringify(booking);
+  }
+  
   return JSON.stringify({ error: 'unknown tool ' + name });
 }
 
@@ -232,8 +255,3 @@ app.get('/debug', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000);
-
-
-
-
-

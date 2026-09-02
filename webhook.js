@@ -14,7 +14,15 @@ const re = () => (_re ??= new Resend(process.env.RESEND_API_KEY));
 const REQUIRED = ['name', 'phone', 'address', 'city', 'issue', 'urgency', 'availability'];
 
 const app = express();
-app.use(express.json());
+// CHANGE 1: bigger body limit so large Vapi payloads can't be silently rejected
+app.use(express.json({ limit: '2mb' }));
+
+// CHANGE 2: log every request so you can watch Vapi's calls live in Railway logs
+app.use((req, res, next) => {
+  console.log('>> ' + req.method + ' ' + req.originalUrl + ' | x-vapi-secret: ' +
+    (req.headers['x-vapi-secret'] === undefined ? 'MISSING' : 'present'));
+  next();
+});
 
 app.get('/', (req, res) => res.send('Server is live'));
 
@@ -41,31 +49,73 @@ app.get('/test-save', async (req, res) => {
   catch (e) { res.status(500).send('Test failed: ' + e.message); }
 });
 
+// NEW: browser-based end-to-end test — no phone call needed
+// Open: https://YOUR-APP.up.railway.app/selftest?key=YOUR_VAPI_SECRET
+app.get('/selftest', async (req, res) => {
+  if (req.query.key !== process.env.VAPI_SECRET) return res.sendStatus(401);
+  const payload = {
+    message: {
+      type: 'tool-calls',
+      toolCalls: [{
+        id: 'selftest-1', type: 'function',
+        function: { name: 'checkAvailability', arguments: JSON.stringify({ preference: 'tomorrow morning' }) }
+      }],
+      call: { id: 'selftest-' + Date.now(), customer: { number: '+15550000000' } }
+    }
+  };
+  const post = async (withSecret) => {
+    const headers = { 'Content-Type': 'application/json' };
+    if (withSecret) headers['x-vapi-secret'] = process.env.VAPI_SECRET;
+    const r = await fetch('http://localhost:' + (process.env.PORT || 3000) + '/webhook/vapi', {
+      method: 'POST', headers, body: JSON.stringify(payload)
+    });
+    return { httpStatus: r.status, responseBody: (await r.text()).slice(0, 500) };
+  };
+  const out = {};
+  try { out.withSecretHeader = await post(true); } catch (e) { out.withSecretHeader = { error: e.message }; }
+  try { out.withoutSecretHeader = await post(false); } catch (e) { out.withoutSecretHeader = { error: e.message }; }
+  const ok = out.withSecretHeader.httpStatus === 200 && (out.withSecretHeader.responseBody || '').includes('"result"');
+  out.verdict = ok
+    ? 'PASS: server returns 200 + [{ "result": "..." }], exactly what Vapi expects. If Vapi still says "No result returned", the problem is in the Vapi tool settings (per-tool Server URL without secret, async enabled, or wrong URL) — not this server.'
+    : 'FAIL: this server is NOT returning a valid tool result. Check withSecretHeader above and the Railway logs.';
+  res.json(out);
+});
+
 app.post('/webhook/vapi', async (req, res) => {
-  if (req.headers['x-vapi-secret'] !== process.env.VAPI_SECRET) return res.sendStatus(401);
-  const msg = req.body.message;
-  if (!msg) return res.sendStatus(200);
+  // CHANGE 3: make auth failures LOUD instead of silent
+  if (req.headers['x-vapi-secret'] !== process.env.VAPI_SECRET) {
+    console.log('!! AUTH FAILED -> 401. header received: ' + JSON.stringify(req.headers['x-vapi-secret']) +
+      ' | VAPI_SECRET on server: ' + JSON.stringify(process.env.VAPI_SECRET));
+    return res.sendStatus(401);
+  }
+
+  const msg = req.body?.message;
+  if (!msg) { console.log('!! request had no "message" object'); return res.sendStatus(200); }
+
   try {
     if (msg.type === 'tool-calls' || msg.type === 'tool-call') {
       const calls = msg.toolCalls ?? (msg.toolCall ? [msg.toolCall] : []);
+      console.log('>> tool message "' + msg.type + '": ' + (calls.map(c => c.function?.name).join(', ') || 'NO CALLS FOUND'));
+      if (!calls.length) console.log('!! no tool calls in payload. message keys: ' + Object.keys(msg).join(', '));
+
       const results = [];
-      // FIX: Reverted to the exact response format Vapi expects
       for (const tc of calls) {
-        results.push({ 
-          toolCallId: tc.id,  // <--- THIS IS THE MISSING LINE
-          result: await runTool(tc, msg) 
-        });
+        const result = await runTool(tc, msg);
+        console.log('>> result sent to Vapi for "' + tc.function?.name + '": ' + String(result).slice(0, 300));
+        results.push({ result });
       }
-      return res.json(results);
+      // CHANGE 4: "tool-calls" (plural) expects an ARRAY of results; "tool-call" (singular) expects ONE object
+      return res.json(msg.type === 'tool-call' && results.length === 1 ? results[0] : results);
     }
+
     if (msg.type === 'end-of-call-report') {
       res.sendStatus(200);
       finalizeLead(msg).catch(console.error);
       return;
     }
   } catch (e) {
-    console.error('webhook error', e);
-    return res.json([{ result: JSON.stringify({ error: 'temporary system issue' }) }]);
+    console.error('!! webhook error', e);
+    return res.json([{ result: 'Temporary system error, please try again.' }]);
   }
   res.sendStatus(200);
 });
@@ -79,20 +129,18 @@ async function runTool(tc, msg) {
     const p = await saveProfile(msg.call.id, args, msg.call?.customer?.number);
     return JSON.stringify({ received: p.received, stillNeeded: p.stillNeeded });
   }
-  
+
   if (name === 'checkAvailability') {
     const result = await findSlots(args.preference);
     if (result.error) return JSON.stringify({ error: result.error });
     if (!result.slots || result.slots.length === 0) return JSON.stringify({ error: "No slots available. Tell the user a manager will call them." });
-    
     const slotText = result.slots.map(s => `${s.when} (ID: ${s.id})`).join(', ');
-    
     if (result.fallback) {
       return `I couldn't find any slots matching the exact preference, but here are the closest available times: ${slotText}. Ask the user if any of these work.`;
     }
     return `Available slots: ${slotText}. Ask the user which one they prefer.`;
   }
-  
+
   if (name === 'bookAppointment') {
     const booking = await book(msg.call.id, args.slotId);
     if (booking.status === 'confirmed') {
@@ -100,7 +148,7 @@ async function runTool(tc, msg) {
     }
     return JSON.stringify(booking);
   }
-  
+
   return JSON.stringify({ error: 'unknown tool ' + name });
 }
 
@@ -134,7 +182,7 @@ async function findSlots(preference) {
     .eq('booked', false)
     .gte('starts_at', new Date().toISOString())
     .order('starts_at').limit(60);
-    
+
   if (error) {
     console.error('findSlots error:', error.message);
     return { error: "Database error finding slots." };
@@ -152,23 +200,15 @@ async function findSlots(preference) {
 
   let isFallback = false;
   let chosen = filtered;
-  
-  if (chosen.length === 0) {
-    chosen = open ?? [];
-    isFallback = true;
-  }
-  
+  if (chosen.length === 0) { chosen = open ?? []; isFallback = true; }
+
   const finalSlots = chosen.slice(0, 3);
-  
-  if (finalSlots.length === 0) {
-    return { error: "No slots available in the database." };
-  }
+  if (finalSlots.length === 0) return { error: "No slots available in the database." };
 
   const mapped = finalSlots.map(s => ({
     id: s.id,
     when: new Date(s.starts_at).toLocaleString('en-US', { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
   }));
-  
   return { slots: mapped, fallback: isFallback };
 }
 

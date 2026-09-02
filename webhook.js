@@ -318,14 +318,14 @@ async function notifyPartiesInstant(callId, code, when) {
   }
 }
 
-async function sendOwnerSheet(lead) {
+async function sendOwnerSheet(lead, recordingUrl) {
   await sms('Lead complete: ' + (lead.name ?? 'Unknown') + (lead.booked ? ' — BOOKED' : ' — not booked') + '. ' + (lead.phone ?? 'no phone') + '. Full sheet in email.');
   const rows = Object.entries(lead).filter(([k]) => k !== 'transcript')
     .map(([k, v]) => k + ': ' + (v ?? '—')).join('\n');
   const { error } = await re().emails.send({
     from: process.env.OWNER_EMAIL_FROM, to: process.env.OWNER_EMAIL,
     subject: 'New lead: ' + (lead.name ?? 'Unknown') + (lead.booked ? ' (BOOKED)' : ''),
-    text: rows + '\n\n--- TRANSCRIPT ---\n' + (lead.transcript || '(none)')
+    text: rows + '\n\n🔊 Call Recording Link: ' + (recordingUrl || 'Not available yet') + '\n\n--- TRANSCRIPT ---\n' + (lead.transcript || '(none)')
   });
   if (error) console.error('email error:', error.message);
 }
@@ -333,8 +333,17 @@ async function sendOwnerSheet(lead) {
 async function sms(body, toPhone) {
   const recipient = toPhone || process.env.OWNER_PHONE;
   for (let i = 0; i < 4; i++) {
-    try { return await tw().messages.create({ body, from: process.env.TWILIO_FROM, to: recipient }); }
-    catch (e) { console.error('twilio retry ' + i + ':', e.message); await new Promise(r => setTimeout(r, 500 * 2 ** i)); }
+    try { 
+      const res = await fetch('https://api.telnyx.com/v2/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + process.env.TELNYX_API_KEY },
+        body: JSON.stringify({ from: process.env.TELNYX_FROM, to: recipient, text: body })
+      });
+      if (res.ok) return;
+      console.error('telnyx api error:', await res.text());
+    }
+    catch (e) { console.error('telnyx retry ' + i + ':', e.message); }
+    await new Promise(r => setTimeout(r, 500 * 2 ** i));
   }
   await sb().from('notify_failures').insert({ channel: 'sms', body });
 }

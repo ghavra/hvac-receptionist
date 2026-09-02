@@ -136,13 +136,19 @@ app.post('/webhook/vapi', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 async function runTool(tc, msg) {
   const name = tc.function?.name;
-  const rawArgs = tc.function?.arguments || '{}';
-  let args = {};
-  try { args = JSON.parse(rawArgs); } catch {}
 
-  // LOG EVERYTHING so we can see exactly what the AI is sending
-  console.log('>> runTool "' + name + '" — raw arguments: ' + rawArgs);
-  console.log('>> runTool "' + name + '" — parsed args keys: ' + Object.keys(args).join(', '));
+  // ✅ CRITICAL FIX: Vapi sends arguments as an already-parsed object, NOT a JSON string.
+  // JSON.parse(anObject) silently fails because it converts to "[object Object]" first.
+  let args = {};
+  const rawArgs = tc.function?.arguments;
+  if (typeof rawArgs === 'string') {
+    try { args = JSON.parse(rawArgs); } catch {}
+  } else if (rawArgs && typeof rawArgs === 'object') {
+    args = rawArgs;
+  }
+
+  console.log('>> runTool "' + name + '" — typeof arguments: ' + typeof rawArgs);
+  console.log('>> runTool "' + name + '" — parsed args: ' + JSON.stringify(args));
 
   if (name === 'saveCustomerInfo') {
     const p = await saveProfile(msg.call.id, args, msg.call?.customer?.number);
@@ -324,5 +330,4 @@ async function sms(body) {
 }
 
 app.listen(process.env.PORT || 3000);
-
 
